@@ -1,0 +1,174 @@
+import boto3
+import uuid
+from datetime import datetime
+
+def generate_collection_id(bucket, key):
+    # Remove characters that do not match the regular expression pattern
+    return f"{bucket}-{key.replace('/', '-').replace(' ', '_').replace(':', '')}"
+
+def lambda_handler(event, context):
+    # Get the S3 bucket and object key from the event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+
+    # Generate a unique collection ID for the image
+    collection_id = generate_collection_id(bucket, key)
+
+    rekognition_client = boto3.client('rekognition')
+
+    # Check if the student has uploaded before
+    dynamodb = boto3.client('dynamodb')
+    dynamodb_table = 'StudentCoins'
+
+    try:
+        # Check if the student has uploaded before
+        response = dynamodb.get_item(
+            TableName=dynamodb_table,
+            Key={
+                'StudentId': {'S': key}  # Use 'StudentId' as the key
+            },
+            ProjectionExpression='ExternalId'
+        )
+        if 'Item' not in response:
+            # Generate a unique external ID for the student
+            external_id = str(uuid.uuid4())
+            # Store the external ID and timestamp in DynamoDB
+            dynamodb.put_item(
+                TableName=dynamodb_table,
+                Item={
+                    'StudentId': {'S': key},  # Use 'StudentId' as the key
+                    'ExternalId': {'S': external_id},
+                    'CoinBalance': {'N': '0'},
+                    'Timestamp': {'S': str(datetime.now())}  # Include the timestamp
+                }
+            )
+            print(f"Generated external ID {external_id} for StudentId: {key}")
+        else:
+            # Student has uploaded before, get their existing external ID
+            external_id = response['Item']['ExternalId']['S']
+            print(f"Found existing external ID {external_id} for StudentId: {key}")
+    except Exception as e:
+        print(f"Error updating external ID: {e}")
+        return {
+            'statusCode': 500,
+            'body': 'Error updating external ID'
+        }
+
+    # Check if the collection ID exists, if not, create it
+    try:
+        rekognition_client.describe_collection(CollectionId=collection_id)
+    except rekognition_client.exceptions.ResourceNotFoundException:
+        rekognition_client.create_collection(CollectionId=collection_id)
+        print(f"Created collection with ID: {collection_id}")
+
+    # Index the face
+    skey = 'WhatsApp Image 2024-04-21 at 21.06.19.jpeg'
+    try:
+        response = rekognition_client.index_faces(
+            CollectionId=collection_id,
+            Image={
+                'S3Object': {
+                    'Bucket': 'studentimage',
+                    'Name': skey
+                }
+            },
+            ExternalImageId=external_id
+        )
+        print(f"Face indexed: {response['FaceRecords'][0]['Face']['FaceId']}")
+    except Exception as e:
+        print(f"Error indexing face: {e}")
+        return {
+            'statusCode': 500,
+            'body': 'Error indexing face'
+        }
+
+    # Process the MP4 video file
+    try:
+        response = rekognition_client.start_face_search(
+            Video={
+                'S3Object': {
+                    'Bucket': bucket,
+                    'Name': key
+                }
+            },
+            CollectionId=collection_id,
+            FaceMatchThreshold=80.0,
+            JobTag='face-search-job'
+        )
+        job_id = response['JobId']
+    except Exception as e:
+        print(f"Error processing video: {e}")
+        return {
+            'statusCode': 500,
+            'body': 'Error processing video'
+        }
+
+    # Wait for the face search job to complete
+    while True:
+        response = rekognition_client.get_face_search(
+            JobId=job_id,
+            MaxResults=10,
+            SortBy='INDEX'
+        )
+        if response['JobStatus'] in ['SUCCEEDED', 'FAILED']:
+            break
+
+    # Check if there are any matches
+    if response['Persons']:
+        # Check if the video has already been processed
+        try:
+            response = dynamodb.get_item(
+                TableName=dynamodb_table,
+                Key={
+                    'StudentId': {'S': key}  # Use 'StudentId' as the key
+                },
+                ProjectionExpression='CoinBalance'
+            )
+            if 'Item' in response and 'CoinBalance' in response['Item'] and int(response['Item']['CoinBalance']['N']) > 0:
+                print(f"Video {key} already processed, skipping coin increment")
+                return {
+                    'statusCode': 200,
+                    'body': 'Video already processed, skipping coin increment'
+                }
+        except Exception as e:
+            print(f"Error checking if video has been processed: {e}")
+            return {
+                'statusCode': 500,
+                'body': 'Error checking if video has been processed'
+            }
+
+        # Faces are the same person, increment coin balance
+        try:
+            dynamodb.update_item(
+                TableName=dynamodb_table,
+                Key={
+                    'StudentId': {'S': key}  # Use 'StudentId' as the key
+                },
+                UpdateExpression='SET CoinBalance = CoinBalance + :val',
+                ExpressionAttributeValues={
+                    ':val': {'N': '2'}
+                }
+            )
+            print(f"Coin balance incremented for StudentId: {key}")
+        except Exception as e:
+            print(f"Error incrementing coin balance: {e}")
+            return {
+                'statusCode': 500,
+                'body': 'Error incrementing coin balance'
+            }
+        finally:
+            # Delete the video and photo from the S3 buckets
+            s3 = boto3.resource('s3')
+            s3.Object(bucket, key).delete()
+            s3.Object('studentimage', skey).delete()
+            print(f"Deleted video {key} and photo {skey}")
+        return {
+            'statusCode': 200,
+            'body': 'Faces match'
+        }
+    else:
+        # Faces are not the same person
+        return {
+            'statusCode': 200,
+            'body': 'Faces do not match'
+        }
